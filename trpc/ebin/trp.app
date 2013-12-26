@@ -1,0 +1,11 @@
+{application,trp,
+             [{description,[]},
+              {vsn,"1"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {mod,{trp_app,[]}},
+              {env,[]},
+              {modules,[socket_server,tcp_message_parser,trp_app,
+                        trp_http_conn,trp_http_server,trp_httpc_conn,
+                        trp_httpc_ssl_conn,trp_sup,trp_tcp_conn,
+                        trp_tcp_server,trp_tcpc_conn]}]}.
