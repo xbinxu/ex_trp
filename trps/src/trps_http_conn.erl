@@ -4,32 +4,32 @@
 %%% @doc  
 %%% -------------------------------------------------------------------
 
--module(trp_httpc_conn).
+-module(trps_http_conn).
 -behaviour(gen_server).
 
 %% --------------------------------------------------------------------
 %% Include files
 %% --------------------------------------------------------------------
 
--include("trp.hrl").
+-include("trps.hrl").
 
 %% --------------------------------------------------------------------
 %% External exports
--export([start_link/4, stop/0]).
+-export([start_link/1, stop/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {web_socket=undefined, conn_id=undefined, scheme=http}).
+-record(state, {sock=undefined, scheme=http, ssl_check=false}).
 
 %% ====================================================================
 %% External functions
 %% ====================================================================
-start_link(ConnId, WAddr, WPort, Scheme) ->
-    gen_server:start_link(?MODULE, [ConnId, WAddr, WPort, Scheme], []).
+start_link(Sock) ->
+    gen_server:start_link(?MODULE, [Sock], []).
 
-stop() ->
-    gen_server:cast(?MODULE, stop).
+stop(Pid) ->
+    gen_server:cast(Pid, stop).
 
 %% ====================================================================
 %% Server functions
@@ -43,10 +43,8 @@ stop() ->
 %%          ignore               |
 %%          {stop, Reason}
 %% --------------------------------------------------------------------
-init([ConnId, WAddr, WPort, Scheme]) ->
-    {ok, WSock} = gen_tcp:connect(WAddr, WPort, [binary, {packet, 0}, {active, once}]),
-    
-    {ok, #state{web_socket=WSock, conn_id=ConnId, scheme=Scheme}}.
+init([Sock]) ->
+    {ok, #state{sock=Sock}}.
 
 
 %% --------------------------------------------------------------------
@@ -70,16 +68,13 @@ handle_call(_Request, _From, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
-handle_cast({send_message, <<"\r\n">>}, #state{conn_id=ConnId, scheme=https} = State) ->
-    trp_tcpc_conn:send_message(<<"HTTP/1.0 200 Connection established\r\n\r\n">>, ConnId),
-    {noreply, State#state{scheme=http}};
+handle_cast({send_response, <<"disconn">>}, State) ->
+    ?DEBUG("===============> web server disconnected......", []),
+    {stop, normal, State};
 
-handle_cast({send_message, _Msg}, #state{scheme=https} = State) ->
-    {noreply, State};
-
-handle_cast({send_message, Msg}, #state{web_socket=WSock, scheme=http} = State) ->
-    ?DEBUG("send message to web server: ~n ~p ~n", [Msg]),
-    ok = gen_tcp:send(WSock, Msg),
+handle_cast({send_response, Bin}, #state{sock = Sock} = State) ->
+    ?DEBUG("===============> send response message to http client: ~n ~p", [Bin]),
+    ok = gen_tcp:send(Sock, Bin),
     {noreply, State};
 
 handle_cast(_Msg, State) ->
@@ -92,17 +87,36 @@ handle_cast(_Msg, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
-handle_info({tcp, Socket, Bin}, #state{web_socket=Socket, conn_id=ConnId, scheme=http} = State) ->
-%%     ?DEBUG("receive message from web server: ~n ~p ~n", [Bin]),
-    trp_tcpc_conn:send_message(Bin, ConnId),
+handle_info({tcp, Socket, <<"\r\n">>}, #state{sock=Socket, scheme=https} = State) ->
+    ?DEBUG("==============> http request received from http client: ~n ~p", [<<"\r\n">>]),
+    ok = trps_tcp_server:request_send(Socket, <<"\r\n">>),
+    inet:setopts(Socket, [{active, once}, {packet, 0}]),
+    {noreply, State};
+
+handle_info({tcp, Socket, Bin}, #state{sock=Socket, ssl_check=false} = State) ->
+    ?DEBUG("==============> http request received from http client: ~n ~p", [Bin]),
+    ok = trps_tcp_server:request_send(Socket, Bin),
+    inet:setopts(Socket, [{active, once}]),
+    case binary:match(Bin, <<"CONNECT">>) of
+        nomatch ->
+            {noreply, State};
+        _ ->
+            {noreply, State#state{scheme=https, ssl_check=true}}
+        end;
+
+handle_info({tcp, Socket, Bin}, #state{sock=Socket, ssl_check=true} = State) ->
+    ?DEBUG("==============> https request received from http client: ~n ~p", [Bin]),
+    ok = trps_tcp_server:request_send(Socket, Bin),
     inet:setopts(Socket, [{active, once}]),
     {noreply, State};
 
-handle_info({tcp_closed, _}, #state{conn_id=ConnId} = State) ->
-    trp_tcpc_conn:send_message(<<"disconn">>, ConnId), 
+handle_info({tcp_closed, _Socket}, #state{sock=Sock} = State) ->
+    ?DEBUG("==============> http client connection closed by http client"),
     {stop, normal, State};
 
-handle_info(_Info, State) ->
+handle_info(Info, #state{sock=Socket} = State) ->
+    ?DEBUG("==============> http client connection process received: ~p", [Info]),
+    inet:setopts(Socket, [{active, false}]),
     {noreply, State}.
 
 %% --------------------------------------------------------------------
@@ -110,9 +124,10 @@ handle_info(_Info, State) ->
 %% Description: Shutdown the server
 %% Returns: any (ignored by gen_server)
 %% --------------------------------------------------------------------
-terminate(_Reason, #state{web_socket=Sock, conn_id=ConnId}) ->
-    trp_tcpc_conn:delete_conn(ConnId),
+terminate(_Reason, #state{sock=Sock}) ->
+    ?DEBUG("===============> http client connection process [~p] of sock[~p] terminated ......", [self(), Sock]),
     gen_tcp:close(Sock),
+    trps_http_server:unregister_sock_pid(Sock, self()),
     ok.
 
 %% --------------------------------------------------------------------

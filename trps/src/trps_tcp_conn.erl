@@ -4,46 +4,32 @@
 %%% @doc  
 %%% -------------------------------------------------------------------
 
--module(trp_http_server).
+-module(trps_tcp_conn).
 -behaviour(gen_server).
-
 
 %% --------------------------------------------------------------------
 %% Include files
 %% --------------------------------------------------------------------
 
--include("trp.hrl").
-
+-include("trps.hrl").
 
 %% --------------------------------------------------------------------
 %% External exports
--export([start_link/0, stop/0, register_sock_pid/2, unregister_sock_pid/2, get_pid_by_sock/1, get_conn_pid/0]).
+-export([start_link/1, stop/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {conn_pid=undefined}).
+-record(state, {sock=undefined, rest_bin = <<>>, ping_timer=undefined}).
 
 %% ====================================================================
 %% External functions
 %% ====================================================================
-start_link() ->
-  gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+start_link(Sock) ->
+    gen_server:start_link(?MODULE, [Sock], []).
 
-stop() ->
-    gen_server:cast(?MODULE, stop).
-
-register_sock_pid(Sock, Pid) ->
-    gen_server:call(?MODULE, {register_sock_pid, Sock, Pid}).
-
-unregister_sock_pid(Sock, Pid) ->
-    gen_server:call(?MODULE, {unregister_sock_pid, Sock, Pid}).
-
-get_pid_by_sock(Sock) ->
-    gen_server:call(?MODULE, {get_pid_by_sock, Sock}).
-
-get_conn_pid() ->
-    gen_server:call(?MODULE, get_conn_pid).
+stop(Pid) ->
+    gen_server:cast(Pid, stop).
 
 %% ====================================================================
 %% Server functions
@@ -57,16 +43,9 @@ get_conn_pid() ->
 %%          ignore               |
 %%          {stop, Reason}
 %% --------------------------------------------------------------------
-
-init([]) ->
-    {ok, Port} = application:get_env(https_port),
-    ets:new(http_sockets, [named_table, set]),
-    socket_server:start_link('HTTP SERVER', 
-                             Port, 
-                             fun handle_sock_conn/2, 
-                             fun handle_sock_disconn/2,
-                             [binary, {packet, 0},{reuseaddr, true},{active, once}]),
-    {ok, #state{}}.
+init([Sock]) ->
+    TimerRef = erlang:start_timer(60000, self(), ping),
+    {ok, #state{sock=Sock, ping_timer=TimerRef}}.
 
 
 %% --------------------------------------------------------------------
@@ -79,25 +58,10 @@ init([]) ->
 %%          {stop, Reason, Reply, State}   | (terminate/2 is called)
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
-handle_call({register_sock_pid, Sock, Pid}, _From, State) ->
-    ets:insert(http_sockets, {Sock, Pid}),
-    {reply, ok, State#state{conn_pid=Pid}};
-
-
-handle_call({unregister_sock_pid, Sock, _Pid}, _From, State) ->
-    ets:delete(http_sockets, Sock),
-    {reply, ok, State#state{conn_pid=undefined}};
-
-handle_call({get_pid_by_sock, Sock}, _From, State) ->
-    case ets:lookup(http_sockets, Sock) of
-        [{Sock, Pid}] ->
-            {reply, {ok, Pid}, State};
-        _ ->
-            {reply, undefined, State}
-        end;
-
-handle_call(get_conn_pid, _From, #state{conn_pid=Pid}=State) ->
-    {reply, {ok, Pid}, State};
+handle_call({request_send, FromSock, Bin}, _From, #state{sock=Sock} = State) ->
+    ?DEBUG("=====> deliver request to client: ~n ~p ~n", [Bin]),
+    send_message(FromSock, Sock, Bin),
+    {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -110,8 +74,11 @@ handle_call(_Request, _From, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
+handle_cast({stop, Reason}, State) ->
+    {stop, Reason, State};
+
 handle_cast(stop, State) ->
-    {stop, "Stop by command", State};
+    {stop, normal, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -123,6 +90,33 @@ handle_cast(_Msg, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
+handle_info({tcp, Socket, Bin}, #state{sock=Socket, rest_bin=RestBin} = State) ->
+    case binary:match(Bin, <<"tgw_l7_forward">>) of
+        nomatch ->
+            {ok, NewRestBin, MsgL} = tcp_message_parser:process_received_msg(<<RestBin/binary, Bin/binary>>), 
+            lists:foreach(fun(Msg) -> handle_binary_message(Socket, Msg) end, MsgL),
+            inet:setopts(Socket, [{active, once}]),
+            {noreply, State#state{rest_bin=NewRestBin}};
+        _ ->
+            ?DEBUG("======> tcp client connection established: ~n ~p ~n", [Bin]),
+            trps_tcp_server:reset_sock(Socket, self()),
+            ok= gen_tcp:send(Socket, <<"ok">>),
+            inet:setopts(Socket, [{active, once}]),
+            {noreply, State}
+        end;
+
+handle_info({tcp_closed, _Socket}, State) ->
+    ?DEBUG("=====> tcp connection closed by client..."),
+    trps_tcp_server:clear_sock(self()),
+    {stop, "connection to TRP client closed", State};
+
+
+handle_info({timeout, TimerRef, ping}, #state{sock=Socket, ping_timer=TimerRef}=State) ->
+    ok = send_message(Socket, <<"ping">>),
+    erlang:cancel_timer(TimerRef),
+    NewTimerRef = erlang:start_timer(60000, self(), ping),
+    {noreply, State#state{ping_timer=NewTimerRef}};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -131,8 +125,9 @@ handle_info(_Info, State) ->
 %% Description: Shutdown the server
 %% Returns: any (ignored by gen_server)
 %% --------------------------------------------------------------------
-terminate(Reason, _State) ->
-    ?DEBUG("http server terminated: ~p", [Reason]),
+terminate(_Reason, #state{sock=Sock}) ->
+    trps_tcp_server:clear_sock(self()),
+    gen_tcp:close(Sock),
     ok.
 
 %% --------------------------------------------------------------------
@@ -146,14 +141,27 @@ code_change(_OldVsn, State, _Extra) ->
 %% --------------------------------------------------------------------
 %%% Internal functions
 %% --------------------------------------------------------------------
+send_message(FromSock, Sock, Bin) ->
+    MsgBody = term_to_binary({FromSock, Bin}),
+    send_message(Sock, MsgBody).
 
-%% return {ok, Pid}
-handle_sock_conn(Sock, _ConnNum) -> 
-    inet:setopts(Sock, [binary, {packet, line}, {active, once}]),
-    {ok, Pid} = trp_http_conn:start_link(Sock), 
-    register_sock_pid(Sock, Pid),
-    {ok, Pid}.
+send_message(Sock, Bin) ->
+    MsgLeng = byte_size(Bin),
+    Package = <<MsgLeng:4/native-unit:8, Bin/binary>>,
+    ok = gen_tcp:send(Sock, Package).    
 
-handle_sock_disconn(_Pid, _Why) ->
-    ok.
+handle_binary_message(Sock, <<"ping">>) ->
+    send_message(Sock, <<"pong">>);
 
+handle_binary_message(_Sock, <<"pong">>) ->
+    ok;
+
+handle_binary_message(_Sock, MsgBody) ->
+    {ConnId, Msg} = binary_to_term(MsgBody),
+    ?DEBUG("receive message from client, origin connId: ~p ~n ~p ~n", [ConnId, Msg]),
+    case trps_http_server:get_pid_by_sock(ConnId)  of
+        undefined ->
+            ok;
+        {ok, Pid} ->
+            gen_server:cast(Pid, {send_response, Msg}) 
+        end.

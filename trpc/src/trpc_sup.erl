@@ -27,7 +27,6 @@ start_link() ->
 %% ===================================================================
 init([]) ->
     io:format("start trp client...~n", []),
-    {ok, { {one_for_one, 10, 10}, [?CHILD(trpc_tcp_conn, worker)]} },
-end.
+    {ok, { {one_for_one, 10, 10}, [?CHILD(trpc_tcp_conn, worker)]} }.
             
 

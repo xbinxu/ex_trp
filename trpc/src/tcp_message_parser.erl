@@ -1,7 +1,7 @@
 %% Author: xiaobin
 %% Created: Jul 27, 2012
 %% Description: TODO: Add description to tcp_message_parser
--module(tcpc_message_parser).
+-module(tcp_message_parser).
 
 %%
 %% Include files

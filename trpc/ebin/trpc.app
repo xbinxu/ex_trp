@@ -1,0 +1,12 @@
+{application,trpc,
+             [{description,[]},
+              {vsn,"1.0"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {mod,{trpc_app,[]}},
+              {env,[]},
+              {modules,[socket_server,tcp_message_parser,trp_app,
+                        trp_http_conn,trp_http_server,trp_httpc_conn,
+                        trp_httpc_ssl_conn,trp_sup,trp_tcp_conn,
+                        trp_tcp_server,trp_tcpc_conn,trpc_app,trpc_http_conn,
+                        trpc_http_ssl_conn,trpc_sup,trpc_tcp_conn]}]}.

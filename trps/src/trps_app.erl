@@ -1,4 +1,4 @@
--module(trp_app).
+-module(trps_app).
 
 -behaviour(application).
 
@@ -10,7 +10,7 @@
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
-    trp_sup:start_link().
+    trps_sup:start_link().
 
 stop(_State) ->
     ok.

@@ -4,32 +4,42 @@
 %%% @doc  
 %%% -------------------------------------------------------------------
 
--module(trp_httpc_ssl_conn).
+-module(trps_tcp_server).
 -behaviour(gen_server).
 
 %% --------------------------------------------------------------------
 %% Include files
 %% --------------------------------------------------------------------
-
--include("trp.hrl").
+-include("trps.hrl").
 
 %% --------------------------------------------------------------------
 %% External exports
--export([start_link/3, stop/0]).
+-export([start_link/0, stop/0, reset_sock/2, clear_sock/1, request_send/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {web_socket=undefined, conn_id=undefined, connected=undefined}).
+-record(state, {pid=undefined, sock=undefined}).
 
 %% ====================================================================
 %% External functions
 %% ====================================================================
-start_link(ConnId, WAddr, WPort) ->
-    gen_server:start_link(?MODULE, [ConnId, WAddr, WPort], []).
+start_link() ->
+  gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 stop() ->
     gen_server:cast(?MODULE, stop).
+
+reset_sock(Sock, Pid) ->
+    gen_server:call(?MODULE, {reset_sock, Sock, Pid}). 
+
+clear_sock(Pid) ->
+    gen_server:call(?MODULE, {clear_sock, Pid}).
+
+request_send(FromSock, Bin) ->
+    gen_server:call(?MODULE, {request_send, FromSock, Bin}).
+
+
 
 %% ====================================================================
 %% Server functions
@@ -43,9 +53,11 @@ stop() ->
 %%          ignore               |
 %%          {stop, Reason}
 %% --------------------------------------------------------------------
-init([ConnId, WAddr, WPort]) ->
-    {ok, WSock} = ssl:connect(WAddr, WPort, [{active, once}]), 
-    {ok, #state{web_socket=WSock, conn_id=ConnId}}.
+
+init([]) ->
+    {ok, Port} = application:get_env(tcps_port),
+    socket_server:start_link('TCP SERVER', Port, fun handle_sock_conn/2, fun handle_sock_disconn/2),
+    {ok, #state{}}.
 
 
 %% --------------------------------------------------------------------
@@ -58,6 +70,35 @@ init([ConnId, WAddr, WPort]) ->
 %%          {stop, Reason, Reply, State}   | (terminate/2 is called)
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
+handle_call({reset_sock, Sock, Pid}, _From, #state{pid=undefined}) ->
+    ?DEBUG("reset client connection ~p -> ~p", [Sock, Pid]),
+    {reply, ok, #state{sock=Sock, pid=Pid}};
+
+handle_call({reset_sock, Sock, Pid}, _From, #state{sock=_OSock, pid=OPid}) ->
+    ?DEBUG("reset client connection ~p -> ~p", [Sock, Pid]),
+    gen_server:cast(OPid, {stop, "connection reset by another peer"}),
+    {reply, ok, #state{sock=Sock, pid=Pid}};
+
+
+handle_call({clear_sock, Pid}, From, #state{sock=OSock, pid=OPid}=State) ->
+    case OPid =:= Pid of
+        true ->
+            ?DEBUG("[From: ~p] clear client connection ~p -> ~p =====> undefined -> undefined", [From, OSock, OPid]),
+            {reply, ok, #state{sock=undefined, pid=undefined}};
+        
+        false ->
+            {reply, ok, State}
+        end;
+
+handle_call({request_send, FromSock, Bin}, _From, #state{pid=Pid}=State) ->
+    case Pid of
+        undefined ->
+            {reply, {error, "no client connection available"}, State};
+        _ ->
+            gen_server:call(Pid, {request_send, FromSock, Bin}),
+            {reply, ok, State}
+        end;
+
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
@@ -69,19 +110,8 @@ handle_call(_Request, _From, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
-handle_cast({send_message, <<"\r\n">>}, #state{connected=undefined} = State) ->
-%%     ok = gen_tcp:send(WSock, Msg),
-    {noreply, State#state{connected=true}};
-
-handle_cast({send_message, _Msg}, #state{connected=undefined} = State) ->
-%%     ?DEBUG("send message to web server: ~n ~p ~n", [Msg]),
-%%     ok = gen_tcp:send(WSock, Msg),
-    {noreply, State};
-
-handle_cast({send_message, Msg}, #state{web_socket=WSock, connected=true} = State) ->
-    ?DEBUG("send message to web server: ~n ~p ~n", [Msg]),
-    ok = ssl:send(WSock, Msg),
-    {noreply, State};
+handle_cast(stop, State) ->
+    {stop, "Stop by command", State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -93,16 +123,6 @@ handle_cast(_Msg, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
-handle_info({ssl, Socket, Bin}, #state{web_socket=Socket, conn_id=ConnId} = State) ->
-    ?DEBUG("receive message from web server: ~n ~p ~n", [Bin]),
-    trp_tcpc_conn:send_message(Bin, ConnId),
-    ssl:setopts(Socket, [{active, once}]),
-    {noreply, State};
-
-handle_info({ssl_closed, _}, #state{conn_id=ConnId} = State) ->
-    trp_tcpc_conn:send_message(<<"disconn">>, ConnId), 
-    {stop, normal, State};
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -111,9 +131,8 @@ handle_info(_Info, State) ->
 %% Description: Shutdown the server
 %% Returns: any (ignored by gen_server)
 %% --------------------------------------------------------------------
-terminate(_Reason, #state{web_socket=Sock, conn_id=ConnId}) ->
-    trp_tcpc_conn:delete_conn(ConnId),
-    ssl:close(Sock),
+terminate(Reason, _State) ->
+    ?DEBUG("tcp server terminated: ~p", [Reason]),
     ok.
 
 %% --------------------------------------------------------------------
@@ -124,7 +143,16 @@ terminate(_Reason, #state{web_socket=Sock, conn_id=ConnId}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+
 %% --------------------------------------------------------------------
 %%% Internal functions
 %% --------------------------------------------------------------------
 
+%% return {ok, Pid}
+handle_sock_conn(Sock, _ConnNum) -> 
+    ?DEBUG("Sock connect by peer: ~p", [inet:peername(Sock)]),
+    inet:setopts(Sock, [binary, {packet, 0}, {active, once}]),
+    trps_tcp_conn:start_link(Sock). 
+
+handle_sock_disconn(_Pid, _Why) ->
+    ok.

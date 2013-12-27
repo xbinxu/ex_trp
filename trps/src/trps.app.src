@@ -1,12 +1,12 @@
-{application, trp,
+{application, trps,
  [
   {description, ""},
-  {vsn, "1"},
+  {vsn, "1.0"},
   {registered, []},
   {applications, [
                   kernel,
                   stdlib
                  ]},
-  {mod, { trp_app, []}},
+  {mod, {trps_app, []}},
   {env, []}
  ]}.
