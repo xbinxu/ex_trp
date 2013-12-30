@@ -20,7 +20,7 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {proxy_socket = undefined, rest_bin = <<>>, timer=undefined}).
+-record(state, {proxy_socket = undefined, rest_bin = <<>>, timer = undefined, connect_timer = undefined}).
 
 %% ====================================================================
 %% External functions
@@ -51,18 +51,19 @@ delete_conn(ConnId) ->
 %% --------------------------------------------------------------------
 init([]) ->
     process_flag(trap_exit, true),
-    
-    {ok, PAddr} = application:get_env(domain_name),
-    {ok, PPort} = application:get_env(tcps_port),
-    {ok, PSock} = gen_tcp:connect(PAddr, PPort, [binary, {packet, 0}, {active, once}]),
-    
+
     ets:new(sock_table, [named_table, set]),
-    DomainName = list_to_binary(PAddr),
-    ok = gen_tcp:send(PSock, <<"tgw_l7_forward\r\nHost: ", DomainName/binary, ":8002\r\n\r\n">>),
-    
-    TimerRef = erlang:start_timer(60000, self(), ping),
-    
-    {ok, #state{proxy_socket = PSock, rest_bin = <<>>, timer = TimerRef}}.
+
+    case connect_server() of
+        {ok, Sock} ->
+            TimerRef = erlang:start_timer(60000, self(), ping),
+            {ok, #state{proxy_socket = Sock, rest_bin = <<>>, timer = TimerRef}};
+        _Other ->
+            TimerRef = erlang:start_timer(3000, self(), reconnect),
+            {ok, #state{connect_timer = TimerRef}}
+        end.
+
+
 
 
 %% --------------------------------------------------------------------
@@ -106,7 +107,7 @@ handle_cast(_Msg, State) ->
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
 handle_info({tcp, Socket, <<"ok">>}, #state{proxy_socket=Socket} = State) ->
-    ?DEBUG("tcp connection with proxy server established", []),
+    ?INFO_MSG("connection with proxy server established", []),
     inet:setopts(Socket, [{active, once}]),
     {noreply, State};
 
@@ -117,13 +118,26 @@ handle_info({tcp, Socket, Bin}, #state{proxy_socket=Socket, rest_bin=RestBin} = 
     {noreply, State#state{rest_bin=NewRestBin}};
 
 handle_info({tcp_closed, _}, State) ->
-    {stop, "tcp conn closed", State};
+    ?INFO_MSG("tcp connection closed by server.", []),
+    TimerRef = erlang:start_timer(3000, self(), reconnect),
+    {noreply, State#state{connect_timer = TimerRef}};
 
 handle_info({timeout, TimerRef, ping}, #state{proxy_socket=PSock, timer=TimerRef}=State) ->
     ok = send_message_i(PSock, <<"ping">>),
     erlang:cancel_timer(TimerRef),
     NewTimerRef = erlang:start_timer(60000, self(), ping),
     {noreply, State#state{timer=NewTimerRef}};
+
+handle_info({timeout, TimerRef, reconnect}, #state{connect_timer = TimerRef}=State) ->
+    erlang:cancel_timer(TimerRef),
+    case connect_server() of
+        {ok, Sock} ->
+            NewTimerRef = erlang:start_timer(60000, self(), ping),
+            {noreply, State#state{proxy_socket = Sock, rest_bin = <<>>, timer = NewTimerRef}};
+        _Other ->
+            NewTimerRef = erlang:start_timer(3000, self(), reconnect),
+            {noreply, State#state{connect_timer = NewTimerRef}}
+        end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -212,6 +226,23 @@ default_addr_port() ->
     {ok, Addr} = application:get_env(web_server_addr),
     {ok, Port} = application:get_env(web_server_port),
     {http, Addr, Port}.
+
+connect_server() ->
+    {ok, Host} = application:get_env(domain_name),
+    {ok, Port} = application:get_env(tcps_port),
+
+    ?INFO_MSG("trying connect to ~s:~p...", [Host, Port]),
+
+    case gen_tcp:connect(Host, Port, [binary, {packet, 0}, {active, once}]) of 
+        {ok, Sock} ->  
+            ?INFO_MSG("connected.", []),
+            DomainName = list_to_binary(Host),
+            ok = gen_tcp:send(Sock, <<"tgw_l7_forward\r\nHost: ", DomainName/binary, ":8002\r\n\r\n">>),
+            {ok, Sock};
+        Other ->
+            ?INFO_MSG("connect to ~p:~p failed: ~p", [Host, Port, Other]),
+            Other
+        end.
     
     
     

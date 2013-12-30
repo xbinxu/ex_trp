@@ -71,11 +71,11 @@ init([]) ->
 %%          {stop, Reason, State}            (terminate/2 is called)
 %% --------------------------------------------------------------------
 handle_call({reset_sock, Sock, Pid}, _From, #state{pid=undefined}) ->
-    ?DEBUG("reset client connection ~p -> ~p", [Sock, Pid]),
+    ?INFO_MSG("client connection established ~p -> ~p", [Sock, Pid]),
     {reply, ok, #state{sock=Sock, pid=Pid}};
 
 handle_call({reset_sock, Sock, Pid}, _From, #state{sock=_OSock, pid=OPid}) ->
-    ?DEBUG("reset client connection ~p -> ~p", [Sock, Pid]),
+    ?WARNING_MSG("reset client connection ~p -> ~p", [Sock, Pid]),
     gen_server:cast(OPid, {stop, "connection reset by another peer"}),
     {reply, ok, #state{sock=Sock, pid=Pid}};
 
@@ -132,7 +132,7 @@ handle_info(_Info, State) ->
 %% Returns: any (ignored by gen_server)
 %% --------------------------------------------------------------------
 terminate(Reason, _State) ->
-    ?DEBUG("tcp server terminated: ~p", [Reason]),
+    ?ERROR_MSG("tcp server terminated: ~p", [Reason]),
     ok.
 
 %% --------------------------------------------------------------------
@@ -150,7 +150,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% return {ok, Pid}
 handle_sock_conn(Sock, _ConnNum) -> 
-    ?DEBUG("Sock connect by peer: ~p", [inet:peername(Sock)]),
+    ?INFO_MSG("Sock connect by peer: ~p", [inet:peername(Sock)]),
     inet:setopts(Sock, [binary, {packet, 0}, {active, once}]),
     trps_tcp_conn:start_link(Sock). 
 
